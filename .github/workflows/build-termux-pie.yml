@@ -103,11 +103,12 @@ jobs:
             local out="dist/binaries/${name}_linux_arm64"
             # GOOS=android is what lays out TLS for Bionic (see below), and it
             # makes Go's runtime/cgo pull in android/log.h — so the C compiler
-            # must target android, not musl. zig names the android target
-            # "aarch64-linux-android<api>" (the API level is mandatory).
+            # must target android, not musl. zig's triple for android puts the
+            # API level on the ABI field with a DOT (see Target/Query.zig's
+            # zigTriple), unlike glibc versions, which use a hyphen.
             # 24 = Android 5.0, old enough to run on essentially every device
             # while still providing the headers Go's runtime/cgo needs.
-            local cc_cmd="${ZIG} cc -target aarch64-linux-android24-androideabi"
+            local cc_cmd="${ZIG} cc -target aarch64-linux-android.24"
             # GOOS=android is the key to the TLS alignment. Go's runtime knows
             # the android target and lays out TLS for Bionic (it parks its TCB in
             # the PT_TLS alignment padding); GOOS=linux builds for musl and emits
