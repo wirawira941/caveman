@@ -89,6 +89,66 @@ jobs:
 
           build_cgo() {
             local name="$1" pkg="$2"
+            echo "::group::build $name (cgo, PIE)"
+            # The tree-sitter grammars are C, so these two need a C compiler.
+            # Use the runner's own clang/gcc (targeting glibc/bionic) rather than
+            # zig: zig has no Android headers, and a musl static build leaves
+            # PT_TLS.p_align at 8, which Android rejects ("TLS segment is
+            # underaligned ... needs to be at least 64"). Linking against the
+            # host libc makes LLD emit the 64-byte alignment Bionic needs, and
+            # produces a real dynamic PIE that runs on-device.
+            local cc_cmd="${CAVEMAN_CC:-cc}"
+            local out="dist/binaries/${name}_linux_arm64"
+            local base=(CGO_ENABLED=1 GOOS=linux GOARCH=arm64)
+            mkdir -p dist/recipes
+            local recipe_file="dist/recipes/${name}"
+
+            # Each entry: "<label>|<ldflags>|<extra build flags>"
+            # -extldflags=-pie alone fails: LLD demands PIC objects, but only
+            # -buildmode=pie compiles Go code as PIC. So buildmode=pie must be
+            # present; what varies is how the *external* linker produces PIE.
+            # Recipe D is the one that works on Android: plain -buildmode=pie with
+            # a real external linker and no -static, so the binary links against
+            # the system libc and gets the TLS layout Bionic expects.
+            local recipes=(
+              "D|-s -w -X main.version=${VERSION}|-buildmode=pie"
+              "C|-extldflags '-static -s' -s -w -X main.version=${VERSION}|-buildmode=pie"
+              "B|-linkmode external -extldflags '-static-pie -s' -s -w -X main.version=${VERSION}|-buildmode=pie"
+              "A|-linkmode external -extldflags '-static -s' -s -w -X main.version=${VERSION}|-buildmode=pie"
+            )
+            local static_recipes="A B C"
+            local tags_arg="-tags netgo,osusergo"
+
+            local label ldflags extra rest
+            for entry in "${recipes[@]}"; do
+              label="${entry%%|*}"
+              rest="${entry#*|}"
+              ldflags="${rest%%|*}"
+              extra="${rest##*|}"
+
+              # A failed link can leave a partial or stale $out behind, which would
+              # make is_pie() read the previous recipe's output. Remove it before
+              # every attempt so only a genuine success can pass the check.
+              rm -f "$out"
+              echo "trying recipe $label"
+              # shellcheck disable=SC2086
+              if env "${base[@]}" CC="$cc_cmd" go build -trimpath $extra \
+                $tags_arg -ldflags "$ldflags" -o "$out" "./$pkg" 2>&1 && is_pie "$out"; then
+                echo "$label" > "$recipe_file"
+                echo "recipe: $label"
+                break
+              fi
+            done
+
+            if [ ! -s "$recipe_file" ]; then
+              echo "::error::$name: no recipe produced a PIE binary"
+              return 1
+            fi
+            echo "::endgroup::"
+          }
+
+          build_cgo_old() {
+            local name="$1" pkg="$2"
             echo "::group::build $name (cgo via zig cc, static PIE)"
             # Mirror releaseGoBuild(): cgo on for the tree-sitter grammars,
             # netgo/osusergo on Linux, fully static via musl. The stock release
