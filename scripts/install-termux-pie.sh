@@ -48,7 +48,9 @@ resolve_src() {
       ;;
   esac
 
-  # Flatten: the artifact may nest one directory level.
+  # Flatten: the artifact may nest one or two directory levels
+  # (artifacts unpack to binaries/ and recipes/ side by side).
+  if [ -d "$src/binaries" ]; then src="$src/binaries"; fi
   if [ -d "$src/dist/binaries" ]; then src="$src/dist/binaries"; fi
   src="$src"
 }
