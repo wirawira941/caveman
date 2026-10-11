@@ -101,13 +101,16 @@ jobs:
             # below knows whether to expect a fully static binary (A-C) or a
             # dynamic one (D).
             local out="dist/binaries/${name}_linux_arm64"
-            local cc_cmd="${ZIG} cc -target aarch64-linux-musl"
+            # GOOS=android is what lays out TLS for Bionic (see below), and it
+            # makes Go's runtime/cgo pull in android/log.h — so the C compiler
+            # must target android, not musl. zig's android target provides those
+            # headers via its bundled libc.
+            local cc_cmd="${ZIG} cc -target aarch64-android"
             # GOOS=android is the key to the TLS alignment. Go's runtime knows
             # the android target and lays out TLS for Bionic (it parks its TCB in
             # the PT_TLS alignment padding); GOOS=linux builds for musl and emits
             # p_align 8, which Android rejects with "TLS segment is
-            # underaligned: alignment is 8, needs to be at least 64". Tailscale's
-            # Termux instructions use the same GOOS=android + buildmode=pie.
+            # underaligned: alignment is 8, needs to be at least 64".
             local base=(CGO_ENABLED=1 GOOS=android GOARCH=arm64)
             mkdir -p dist/recipes
             local recipe_file="dist/recipes/${name}"
