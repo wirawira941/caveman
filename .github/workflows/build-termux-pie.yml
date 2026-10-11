@@ -57,9 +57,10 @@ jobs:
           unzip -q "$RUNNER_TEMP/ndk.zip" -d "$RUNNER_TEMP"
           toolchain="$RUNNER_TEMP/${ndk}/toolchains/llvm/prebuilt/linux-aarch64"
           # API 24 = Android 5.0, the floor Go's android target supports.
-          echo "CAVEMAN_CC=${toolchain}/bin/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
+          cc="${toolchain}/bin/aarch64-linux-android24-clang"
+          echo "CAVEMAN_CC=${cc}" >> "$GITHUB_ENV"
           echo "NDK_TOOLCHAIN=${toolchain}" >> "$GITHUB_ENV"
-          "$CAVEMAN_CC" --version | head -1
+          "$cc" --version | head -1
 
       - name: Install pinned zig (cgo compiler for grammars)
         run: |
