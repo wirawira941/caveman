@@ -74,12 +74,14 @@ jobs:
           elf_type() { readelf -h "$1" 2>/dev/null | sed -n 's/^ *Type: *//p' | cut -d' ' -f1 | tr -d '[:space:]'; }
           is_pie() { [ "$(elf_type "$1")" = "DYN" ]; }
 
+          # Pure-Go binaries take -buildmode=pie directly. They still need the
+          # TLS alignment fix (see build_cgo) or Bionic refuses them too.
           build_pure() {
             local name="$1" pkg="$2"
             echo "::group::build $name (pure Go, PIE)"
             CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath \
               -buildmode=pie \
-              -ldflags "-s -w -X main.version=${VERSION}" \
+              -ldflags "-extldflags '-z common-page-size=64' -s -w -X main.version=${VERSION}" \
               -o "dist/binaries/${name}_linux_arm64" \
               "./${pkg}"
             echo "::endgroup::"
@@ -104,12 +106,21 @@ jobs:
             mkdir -p dist/recipes
             local recipe_file="dist/recipes/${name}"
 
+            # Android Bionic requires PT_TLS p_align >= (MAX_TLS_SLOT + 1) * 8 = 64
+            # on ARM64 (TLS variant 1: TP + 2-word TCB, then the executable's
+            # segment, with Bionic's TCB parked in the alignment padding). A binary
+            # linked for musl gets p_align 8 and Android aborts with
+            # "executable's TLS segment is underaligned: alignment is 8, needs to
+            # be at least 64 for ARM64 Bionic". Forcing common-page-size=64 makes
+            # the linker emit the alignment Bionic needs.
+            local tls_align="-z common-page-size=64"
+
             # Each entry: "<label>|<ldflags>|<extra build flags>"
             local recipes=(
-              "A|-linkmode external -extldflags '-static -s' -s -w -X main.version=${VERSION}|-buildmode=pie"
-              "B|-linkmode external -extldflags '-static -pie -s' -s -w -X main.version=${VERSION}|"
-              "C|-extldflags '-static -s' -s -w -X main.version=${VERSION}|-buildmode=pie"
-              "D|-s -w -X main.version=${VERSION}|-buildmode=pie"
+              "A|-linkmode external -extldflags '-static -s $tls_align' -s -w -X main.version=${VERSION}|-buildmode=pie"
+              "B|-linkmode external -extldflags '-static -pie -s $tls_align' -s -w -X main.version=${VERSION}|"
+              "C|-extldflags '-static -s $tls_align' -s -w -X main.version=${VERSION}|-buildmode=pie"
+              "D|-extldflags '$tls_align' -s -w -X main.version=${VERSION}|-buildmode=pie"
             )
             local tags_arg="-tags netgo,osusergo"
 
@@ -164,6 +175,13 @@ jobs:
             # Termux with "unexpected e_type: 2".
             if [ "$t" != "DYN" ]; then
               echo "::error::$f is not PIE (Type: $t) — it will not run on Android"
+              fail=1
+            fi
+            # Android Bionic also requires PT_TLS p_align >= 64 on ARM64. This
+            # catches a build where the alignment flag did not reach the linker.
+            ta="$(readelf -l "$f" | awk '/^  TLS/ {print strtonum("0x" $NF)}')"
+            if [ -n "$ta" ] && [ "$ta" -lt 64 ]; then
+              echo "::error::$f TLS p_align is $ta, needs >= 64 for Android Bionic"
               fail=1
             fi
           done
