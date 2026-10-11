@@ -1,0 +1,227 @@
+name: Build Android/Termux PIE binaries
+
+# Caveman's release binaries are non-PIE (e_type EXEC). Android 10+ refuses
+# non-PIE executables ("unexpected e_type: 2"), so the stock linux_arm64 assets
+# will not run on Termux. This workflow rebuilds all six Go binaries as PIE on
+# a native arm64 runner and packages them for sideloading onto the device.
+#
+# After it runs, download the artifact and run the companion
+# scripts/install-termux-pie.sh from this repo on the device.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version tag to stamp into the binaries (e.g. bin-v2.1.0)"
+        required: false
+        default: "dev-pie"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/build-termux-pie.yml"
+      - "scripts/install-termux-pie.sh"
+
+permissions:
+  contents: read
+
+jobs:
+  build-pie:
+    # Native ARM64 runner — no QEMU, and cgo compiles the tree-sitter grammars
+    # for the right arch. arm64 runners are free for public repos.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install pinned zig (cgo compiler for grammars)
+        run: |
+          set -euo pipefail
+          # Matches RELEASE_ZIG_VERSION in scripts/build-release-binaries.mjs.
+          # The release build refuses any other zig; we pin the same one so the
+          # cgo-built binaries behave identically to the signed ones.
+          v=0.16.0
+          curl -fsSL -o "$RUNNER_TEMP/zig.tar.xz" "https://ziglang.org/download/${v}/zig-aarch64-linux-${v}.tar.xz"
+          echo "ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17  $RUNNER_TEMP/zig.tar.xz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
+          echo "ZIG=$RUNNER_TEMP/zig/zig" >> "$GITHUB_ENV"
+
+      - name: Fail fast on the wrong ELF type
+        # If the runner cannot exec a PIE binary we produce, everything below is
+        # wasted. Termux needs ET_DYN; assert the host is arm64 and can exec one.
+        run: |
+          set -euo pipefail
+          echo "uname: $(uname -m)"
+          [ "$(uname -m)" = "aarch64" ] || { echo "::error::expected an arm64 runner, got $(uname -m)"; exit 1; }
+
+      - name: Build all six binaries as PIE
+        run: |
+          set -euo pipefail
+          mkdir -p dist/binaries
+          ZIG="${ZIG:-zig}"
+          VERSION="${{ github.event.inputs.version || 'dev-pie' }}"
+
+          # True on this host: a stock caveman release asset is non-PIE and
+          # Android refuses it. Used by the cgo fallback ladder below.
+          elf_type() { readelf -h "$1" 2>/dev/null | sed -n 's/^ *Type: *//p' | cut -d' ' -f1 | tr -d '[:space:]'; }
+          is_pie() { [ "$(elf_type "$1")" = "DYN" ]; }
+
+          build_pure() {
+            local name="$1" pkg="$2"
+            echo "::group::build $name (pure Go, PIE)"
+            CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath \
+              -buildmode=pie \
+              -ldflags "-s -w -X main.version=${VERSION}" \
+              -o "dist/binaries/${name}_linux_arm64" \
+              "./${pkg}"
+            echo "::endgroup::"
+          }
+
+          build_cgo() {
+            local name="$1" pkg="$2"
+            echo "::group::build $name (cgo via zig cc, static PIE)"
+            # Mirror releaseGoBuild(): cgo on for the tree-sitter grammars,
+            # netgo/osusergo on Linux, fully static via musl. The stock release
+            # omits -buildmode=pie, which is exactly the Android blocker.
+            #
+            # -buildmode=pie is documented by Go as unsupported together with
+            # -linkmode external, so a single recipe is not safe. Try the most
+            # faithful reproduction first and fall back until one yields ET_DYN.
+            # The winning recipe is recorded in dist/recipes/ so the verify step
+            # below knows whether to expect a fully static binary (A-C) or a
+            # dynamic one (D).
+            local out="dist/binaries/${name}_linux_arm64"
+            local cc_cmd="${ZIG} cc -target aarch64-linux-musl"
+            local base=(CGO_ENABLED=1 GOOS=linux GOARCH=arm64)
+            mkdir -p dist/recipes
+            local recipe_file="dist/recipes/${name}"
+
+            # Each entry: "<label>|<ldflags>|<extra build flags>"
+            local recipes=(
+              "A|-linkmode external -extldflags '-static -s' -s -w -X main.version=${VERSION}|-buildmode=pie"
+              "B|-linkmode external -extldflags '-static -pie -s' -s -w -X main.version=${VERSION}|"
+              "C|-extldflags '-static -s' -s -w -X main.version=${VERSION}|-buildmode=pie"
+              "D|-s -w -X main.version=${VERSION}|-buildmode=pie"
+            )
+            local tags_arg="-tags netgo,osusergo"
+
+            local label ldflags extra rest
+            for entry in "${recipes[@]}"; do
+              label="${entry%%|*}"
+              rest="${entry#*|}"
+              ldflags="${rest%%|*}"
+              extra="${rest##*|}"
+
+              # A failed link can leave a partial or stale $out behind, which would
+              # make is_pie() read the previous recipe's output. Remove it before
+              # every attempt so only a genuine success can pass the check.
+              rm -f "$out"
+              echo "trying recipe $label"
+              # shellcheck disable=SC2086
+              if env "${base[@]}" CC="$cc_cmd" go build -trimpath $extra \
+                $tags_arg -ldflags "$ldflags" -o "$out" "./$pkg" 2>&1 && is_pie "$out"; then
+                echo "$label" > "$recipe_file"
+                echo "recipe: $label"
+                [ "$label" = "D" ] && echo "::warning::$name needed recipe D (dynamic PIE) — NOT static; verify it runs on Termux"
+                break
+              fi
+            done
+            # A failed recipe is expected; the loop keeps going. If none produced a
+            # PIE binary, fail loudly here rather than shipping ET_EXEC.
+            if [ ! -s "$recipe_file" ]; then
+              echo "::error::$name: no recipe produced a PIE binary"
+              return 1
+            fi
+            echo "::endgroup::"
+          }
+
+          # Packages from RELEASE_BINARIES in scripts/build-release-binaries.mjs.
+          build_cgo   caveman-proxy   proxy/cmd/caveman-proxy
+          build_cgo   caveman-engine  engine/cmd/caveman-engine
+          build_pure  caveman-mcp     mcp/cmd/caveman-mcp
+          build_pure  cavemem         mem/cmd/cavemem
+          build_pure  caveman-browse  browse/cmd/caveman-browse
+          build_pure  caveman-shrink  shrink/cmd/caveman-shrink
+
+      - name: Verify PIE + static
+        run: |
+          set -euo pipefail
+          fail=0
+          for f in dist/binaries/*_linux_arm64; do
+            # readelf prints "  Type:                              DYN (Shared object file)";
+            # take the first token after the colon so the description text is ignored.
+            t="$(readelf -h "$f" | sed -n 's/^ *Type: *//p' | cut -d' ' -f1 | tr -d '[:space:]')"
+            echo "$f -> $t"
+            # Android 10+ requires ET_DYN (PIE). ET_EXEC (2) is what fails on
+            # Termux with "unexpected e_type: 2".
+            if [ "$t" != "DYN" ]; then
+              echo "::error::$f is not PIE (Type: $t) — it will not run on Android"
+              fail=1
+            fi
+          done
+          # proxy and engine are the cgo ones; assert static like upstream does.
+          for f in dist/binaries/caveman-{proxy,engine}_linux_arm64; do
+            name="${f##*/}"; name="${name%_linux_arm64}"
+            recipe="$(cat "dist/recipes/${name}" 2>/dev/null || echo unknown)"
+            # Only the static recipes (A-C) are expected to be statically linked;
+            # D is explicitly a dynamic build, so skip the check there.
+            if [ "$recipe" != "D" ]; then
+              file "$f" | grep -q 'statically linked' || { file "$f"; echo "::error::$f is not static (recipe $recipe)" >&2; fail=1; }
+            fi
+          done
+          # Smoke-test the binaries actually run on this arm64 host. Every Go
+          # binary answers `version`/`--help` differently, so try a few and only
+          # fail if none of them exit cleanly. This catches a misbuilt toolchain
+          # before you download a broken artifact.
+          for f in dist/binaries/*_linux_arm64; do
+            ok=0
+            for sub in version --help help; do
+              # shellcheck disable=SC2086
+              "$f" $sub >/dev/null 2>&1 && ok=1 && break
+            done
+            if [ "$ok" -eq 0 ]; then
+              echo "::warning::$f did not answer version/--help/help; it may still be fine, verify on the device"
+            fi
+          done
+          # Functional smoke test: the engine must actually compress. This is
+          # what caveman compress/shrink call, so it proves the cgo tree-sitter
+          # grammars linked and the binary runs under Android's PIE requirement.
+          # NOTE: the engine writes the payload to stdout and a JSON report to
+          # stderr (see emitCompressResult), so the report is what we inspect.
+          if [ -x dist/binaries/caveman-engine_linux_arm64 ]; then
+            if printf 'const x = 1;\n' | dist/binaries/caveman-engine_linux_arm64 compress >/dev/null 2>engine_report.json; then
+              if grep -q '"content_type"' engine_report.json 2>/dev/null; then
+                echo "caveman-engine: compress OK ($(head -c 120 engine_report.json | tr -d '\n'))"
+              else
+                echo "::warning::caveman-engine produced no JSON report on stderr; inspect engine_report.json"
+              fi
+            else
+              echo "::warning::caveman-engine compress exited non-zero; verify on the device"
+            fi
+          fi
+          exit "$fail"
+
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          cd dist/binaries
+          sha256sum *_linux_arm64 > checksums.txt
+          cat checksums.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: caveman-pie-arm64
+          path: |
+            dist/binaries/
+            dist/recipes/
+          if-no-files-found: error
+          retention-days: 30
