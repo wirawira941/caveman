@@ -41,6 +41,26 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Install Android NDK (bionic C compiler for cgo)
+        # caveman-proxy and caveman-engine embed the tree-sitter grammars (C),
+        # so they need a C compiler. Upstream cross-compiles them through zig cc
+        # for musl, but a musl build links statically and leaves PT_TLS.p_align
+        # at 8, which Android rejects ("TLS segment is underaligned ... needs to
+        # be at least 64"). Building with the NDK's clang targets bionic
+        # directly, which gives both the right alignment and a dynamic PIE that
+        # actually runs on-device.
+        run: |
+          set -euo pipefail
+          v=r28b
+          ndk=android-ndk-${v}
+          curl -fsSL -o "$RUNNER_TEMP/ndk.zip" "https://dl.google.com/android/repository/${ndk}-linux.zip"
+          unzip -q "$RUNNER_TEMP/ndk.zip" -d "$RUNNER_TEMP"
+          toolchain="$RUNNER_TEMP/${ndk}/toolchains/llvm/prebuilt/linux-aarch64"
+          # API 24 = Android 5.0, the floor Go's android target supports.
+          echo "CAVEMAN_CC=${toolchain}/bin/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
+          echo "NDK_TOOLCHAIN=${toolchain}" >> "$GITHUB_ENV"
+          "$CAVEMAN_CC" --version | head -1
+
       - name: Install pinned zig (cgo compiler for grammars)
         run: |
           set -euo pipefail
@@ -99,7 +119,11 @@ jobs:
             # produces a real dynamic PIE that runs on-device.
             local cc_cmd="${CAVEMAN_CC:-cc}"
             local out="dist/binaries/${name}_linux_arm64"
-            local base=(CGO_ENABLED=1 GOOS=linux GOARCH=arm64)
+            # GOOS=android makes Go lay out TLS for Bionic (parks its TCB in
+            # the PT_TLS alignment padding) and pull in android/log.h from the
+            # NDK. With GOOS=linux the TLS segment lands at p_align 8, which
+            # Android rejects. The NDK compiler above provides the headers.
+            local base=(CGO_ENABLED=1 GOOS=android GOARCH=arm64)
             mkdir -p dist/recipes
             local recipe_file="dist/recipes/${name}"
 
