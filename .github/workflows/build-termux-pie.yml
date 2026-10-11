@@ -131,7 +131,11 @@ jobs:
             # PIE with TLS runs. So the dynamic recipes come first and the static
             # ones are only fallbacks.
             local recipes=(
-              "D|-s -w -X main.version=${VERSION}|-buildmode=pie"
+              # D first: no -static anywhere, so the binary links dynamically
+              # against the toolchain's libc. A static PIE with a TLS segment
+              # segfaults at startup on Android 10+ (verified on-device), so the
+              # static recipes below are only fallbacks.
+              "D|-linkmode external -extldflags '-dynamic-linker /system/bin/linker64' -s -w -X main.version=${VERSION}|-buildmode=pie"
               "C|-extldflags '-static -s' -s -w -X main.version=${VERSION}|-buildmode=pie"
               "B|-linkmode external -extldflags '-static-pie -s' -s -w -X main.version=${VERSION}|-buildmode=pie"
               "A|-linkmode external -extldflags '-static -s' -s -w -X main.version=${VERSION}|-buildmode=pie"
