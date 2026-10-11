@@ -101,20 +101,13 @@ jobs:
             # below knows whether to expect a fully static binary (A-C) or a
             # dynamic one (D).
             local out="dist/binaries/${name}_linux_arm64"
-            # GOOS=android is what lays out TLS for Bionic (see below), and it
-            # makes Go's runtime/cgo pull in android/log.h — so the C compiler
-            # must target android, not musl. zig's triple for android puts the
-            # API level on the ABI field with a DOT (see Target/Query.zig's
-            # zigTriple), unlike glibc versions, which use a hyphen.
-            # 24 = Android 5.0, old enough to run on essentially every device
-            # while still providing the headers Go's runtime/cgo needs.
-            local cc_cmd="${ZIG} cc -target aarch64-linux-android.24"
-            # GOOS=android is the key to the TLS alignment. Go's runtime knows
-            # the android target and lays out TLS for Bionic (it parks its TCB in
-            # the PT_TLS alignment padding); GOOS=linux builds for musl and emits
-            # p_align 8, which Android rejects with "TLS segment is
-            # underaligned: alignment is 8, needs to be at least 64".
-            local base=(CGO_ENABLED=1 GOOS=android GOARCH=arm64)
+            # GOOS=android would lay out TLS for Bionic, but zig has no Android
+            # libc headers (its lib/libc ships glibc, musl, and the BSDs — no
+            # android/), so cgo cannot find android/log.h, stdlib.h, or
+            # pthread.h. Build for linux/musl as upstream does and fix the TLS
+            # alignment afterwards with scripts/tlsalign (see the verify step).
+            local cc_cmd="${ZIG} cc -target aarch64-linux-musl"
+            local base=(CGO_ENABLED=1 GOOS=linux GOARCH=arm64)
             mkdir -p dist/recipes
             local recipe_file="dist/recipes/${name}"
 
@@ -123,8 +116,8 @@ jobs:
             # segment, with Bionic's TCB parked in the alignment padding). A binary
             # linked for musl gets p_align 8 and Android aborts with
             # "executable's TLS segment is underaligned: alignment is 8, needs to
-            # be at least 64 for ARM64 Bionic". Forcing common-page-size=64 makes
-            # the linker emit the alignment Bionic needs.
+            # be at least 64 for ARM64 Bionic". common-page-size alone does not
+            # fix Go's TLS segment, so the patcher below sets p_align directly.
             local tls_align="-z common-page-size=64"
 
             # Each entry: "<label>|<ldflags>|<extra build flags>"
@@ -132,12 +125,18 @@ jobs:
             # only -buildmode=pie compiles Go code as PIC. So buildmode=pie must
             # be present; what varies is how the *external* linker is told to
             # produce PIE and whether it links statically.
+            #
+            # ORDER MATTERS on Android: a static PIE with a TLS segment segfaults
+            # at startup on Android 10+ (verified on-device), whereas a dynamic
+            # PIE with TLS runs. So the dynamic recipes come first and the static
+            # ones are only fallbacks.
             local recipes=(
-              "A|-linkmode external -extldflags '-static -s' -s -w -X main.version=${VERSION}|-buildmode=pie"
-              "B|-linkmode external -extldflags '-static-pie -s' -s -w -X main.version=${VERSION}|-buildmode=pie"
-              "C|-extldflags '-static -s' -s -w -X main.version=${VERSION}|-buildmode=pie"
               "D|-s -w -X main.version=${VERSION}|-buildmode=pie"
+              "C|-extldflags '-static -s' -s -w -X main.version=${VERSION}|-buildmode=pie"
+              "B|-linkmode external -extldflags '-static-pie -s' -s -w -X main.version=${VERSION}|-buildmode=pie"
+              "A|-linkmode external -extldflags '-static -s' -s -w -X main.version=${VERSION}|-buildmode=pie"
             )
+            local static_recipes="A B C"
             local tags_arg="-tags netgo,osusergo"
 
             local label ldflags extra rest
@@ -181,6 +180,16 @@ jobs:
       - name: Verify PIE + static
         run: |
           set -euo pipefail
+          # The linux/musl builds leave PT_TLS.p_align at 8, which Android
+          # rejects with "TLS segment is underaligned". Fix it now, before the
+          # checks below, so the rest of this step validates the final artifact.
+          # This is the only way to get a runnable binary without a real Android
+          # toolchain: zig has no Android libc headers, so GOOS=android cannot
+          # build the cgo binaries at all.
+          for f in dist/binaries/*_linux_arm64; do
+            scripts/tlsalign "$f" || true
+          done
+
           fail=0
           for f in dist/binaries/*_linux_arm64; do
             # readelf prints "  Type:                              DYN (Shared object file)";
@@ -193,26 +202,31 @@ jobs:
               echo "::error::$f is not PIE (Type: $t) — it will not run on Android"
               fail=1
             fi
-            # Android Bionic also requires PT_TLS p_align >= 64 on ARM64. This
-            # catches a build where the alignment flag did not reach the linker.
+            # Android Bionic also requires PT_TLS p_align >= 64 on ARM64.
+            # scripts/tlsalign above sets it, so a value below 64 here means the
+            # patcher itself failed.
             # readelf -l prints "  TLS  off  vaddr  paddr  filesz memsz flags align",
             # so match the TLS row and take its final field.
             ta="$(readelf -lW "$f" | awk '$1 == "TLS" {print strtonum($NF); exit}')"
             if [ -n "$ta" ] && [ "$ta" -gt 0 ] && [ "$ta" -lt 64 ]; then
-              echo "::error::$f TLS p_align is $ta, needs >= 64 for Android Bionic"
+              echo "::error::$f TLS p_align is $ta after patching, needs >= 64 for Android Bionic"
               fail=1
             fi
           done
           # proxy and engine are the cgo ones; assert static like upstream does.
+          # Only the static recipes (A-C) are expected to be statically linked;
+          # D is explicitly a dynamic build (it is the one that runs on
+          # Android), so skip the check there.
           for f in dist/binaries/caveman-{proxy,engine}_linux_arm64; do
             name="${f##*/}"; name="${name%_linux_arm64}"
             recipe="$(cat "dist/recipes/${name}" 2>/dev/null || echo unknown)"
-            # Only the static recipes (A-C) are expected to be statically linked;
-            # D is explicitly a dynamic build, so skip the check there.
-            # `file` prints "static-pie linked" for a static PIE and "statically
-            # linked" for a static non-PIE; accept either spelling.
-            if [ "$recipe" != "D" ]; then
+            # shellcheck disable=SC2076
+            if [[ " $static_recipes " =~ " $recipe " ]]; then
+              # `file` prints "static-pie linked" for a static PIE and "statically
+              # linked" for a static non-PIE; accept either spelling.
               file "$f" | grep -qE 'static(-pie)? linked' || { file "$f"; echo "::error::$f is not static (recipe $recipe)" >&2; fail=1; }
+            else
+              echo "$f: recipe $recipe — skipping the static check (dynamic build)"
             fi
           done
           # Smoke-test the binaries actually run on this arm64 host. Every Go
