@@ -224,6 +224,7 @@ jobs:
           # Only the static recipes (A-C) are expected to be statically linked;
           # D is explicitly a dynamic build (it is the one that runs on
           # Android), so skip the check there.
+          static_recipes="A B C"
           for f in dist/binaries/caveman-{proxy,engine}_linux_arm64; do
             name="${f##*/}"; name="${name%_linux_arm64}"
             recipe="$(cat "dist/recipes/${name}" 2>/dev/null || echo unknown)"
