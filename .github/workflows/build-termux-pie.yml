@@ -27,13 +27,23 @@ permissions:
 
 jobs:
   build-pie:
-    # Native ARM64 runner — no QEMU, and cgo compiles the tree-sitter grammars
-    # for the right arch. arm64 runners are free for public repos.
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 45
+    # x86_64 runner, not arm64: the Android NDK only ships x86_64-hosted
+    # toolchains, so an arm64 runner cannot execute its clang ("Exec format
+    # error"). Cross-compile from here; GOOS/GOARCH and the NDK's target flags
+    # produce arm64 code.
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Fail fast on the wrong architecture
+        # The NDK's compiler binaries are x86_64; building on any other host
+        # arch fails with "Exec format error". GOOS/GOARCH handle the target.
+        run: |
+          set -euo pipefail
+          echo "uname: $(uname -m)"
+          [ "$(uname -m)" = "x86_64" ] || { echo "::error::expected an x86_64 runner for the NDK toolchain, got $(uname -m)"; exit 1; }
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -79,14 +89,6 @@ jobs:
           mkdir -p "$RUNNER_TEMP/zig"
           tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
           echo "ZIG=$RUNNER_TEMP/zig/zig" >> "$GITHUB_ENV"
-
-      - name: Fail fast on the wrong ELF type
-        # If the runner cannot exec a PIE binary we produce, everything below is
-        # wasted. Termux needs ET_DYN; assert the host is arm64 and can exec one.
-        run: |
-          set -euo pipefail
-          echo "uname: $(uname -m)"
-          [ "$(uname -m)" = "aarch64" ] || { echo "::error::expected an arm64 runner, got $(uname -m)"; exit 1; }
 
       - name: Build all six binaries as PIE
         run: |
@@ -334,26 +336,21 @@ jobs:
               echo "$f: recipe $recipe — skipping the static check (dynamic build)"
             fi
           done
-          # Smoke-test the binaries actually run on this arm64 host. Every Go
+          # Smoke-test the binaries actually run. Every Go
           # binary answers `version`/`--help` differently, so try a few and only
-          # fail if none of them exit cleanly. This catches a misbuilt toolchain
+          # fail if none of them exit cleanly. These are arm64 binaries and this
+          # is an x86_64 host, so skip the exec test when cross-compiling.
           # before you download a broken artifact.
-          for f in dist/binaries/*_linux_arm64; do
-            ok=0
-            for sub in version --help help; do
-              # shellcheck disable=SC2086
-              "$f" $sub >/dev/null 2>&1 && ok=1 && break
-            done
-            if [ "$ok" -eq 0 ]; then
-              echo "::warning::$f did not answer version/--help/help; it may still be fine, verify on the device"
-            fi
-          done
+          # The build cross-compiles for arm64, so the binaries cannot run here.
+          # Execution is verified on the device after install instead.
+          echo "skipping exec smoke tests: building for arm64 on $(uname -m)"
           # Functional smoke test: the engine must actually compress. This is
           # what caveman compress/shrink call, so it proves the cgo tree-sitter
           # grammars linked and the binary runs under Android's PIE requirement.
           # NOTE: the engine writes the payload to stdout and a JSON report to
           # stderr (see emitCompressResult), so the report is what we inspect.
-          if [ -x dist/binaries/caveman-engine_linux_arm64 ]; then
+          # Also skipped when cross-compiling: the arm64 binary cannot run on x86_64.
+          if [ "$(uname -m)" = "aarch64" ] && [ -x dist/binaries/caveman-engine_linux_arm64 ]; then
             if printf 'const x = 1;\n' | dist/binaries/caveman-engine_linux_arm64 compress >/dev/null 2>engine_report.json; then
               if grep -q '"content_type"' engine_report.json 2>/dev/null; then
                 echo "caveman-engine: compress OK ($(head -c 120 engine_report.json | tr -d '\n'))"
