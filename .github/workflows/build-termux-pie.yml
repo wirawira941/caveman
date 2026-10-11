@@ -179,8 +179,10 @@ jobs:
             fi
             # Android Bionic also requires PT_TLS p_align >= 64 on ARM64. This
             # catches a build where the alignment flag did not reach the linker.
-            ta="$(readelf -l "$f" | awk '/^  TLS/ {print strtonum("0x" $NF)}')"
-            if [ -n "$ta" ] && [ "$ta" -lt 64 ]; then
+            # readelf -l prints "  TLS  off  vaddr  paddr  filesz memsz flags align",
+            # so match the line that starts with TLS and take its last field.
+            ta="$(readelf -l "$f" | awk '$1 == "TLS" {gsub(/^0x/,"",$NF); print $NF; exit}')"
+            if [ -n "$ta" ] && [ "$ta" -gt 0 ] && [ "$ta" -lt 64 ]; then
               echo "::error::$f TLS p_align is $ta, needs >= 64 for Android Bionic"
               fail=1
             fi
