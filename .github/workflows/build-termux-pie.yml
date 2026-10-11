@@ -44,22 +44,27 @@ jobs:
       - name: Install Android NDK (bionic C compiler for cgo)
         # caveman-proxy and caveman-engine embed the tree-sitter grammars (C),
         # so they need a C compiler. Upstream cross-compiles them through zig cc
-        # for musl, but a musl build links statically and leaves PT_TLS.p_align
-        # at 8, which Android rejects ("TLS segment is underaligned ... needs to
-        # be at least 64"). Building with the NDK's clang targets bionic
-        # directly, which gives both the right alignment and a dynamic PIE that
-        # actually runs on-device.
+        # for musl, but a musl static build segfaults on Android 10+ (static PIE
+        # + TLS). The NDK's clang targets bionic directly, which gives both the
+        # TLS layout Bionic needs and a dynamic PIE that runs on-device.
         run: |
           set -euo pipefail
           v=r28b
           ndk=android-ndk-${v}
           curl -fsSL -o "$RUNNER_TEMP/ndk.zip" "https://dl.google.com/android/repository/${ndk}-linux.zip"
           unzip -q "$RUNNER_TEMP/ndk.zip" -d "$RUNNER_TEMP"
-          toolchain="$RUNNER_TEMP/${ndk}/toolchains/llvm/prebuilt/linux-aarch64"
+          # The prebuilt dir name varies by NDK version and host arch; find it.
+          prebuilt="$(ls -d "$RUNNER_TEMP/${ndk}"/toolchains/llvm/prebuilt/linux-* | head -1)"
+          [ -n "$prebuilt" ] || { echo "::error::no LLVM prebuilt in the NDK"; ls -R "$RUNNER_TEMP/${ndk}/toolchains/llvm/prebuilt" | head; exit 1; }
           # API 24 = Android 5.0, the floor Go's android target supports.
-          cc="${toolchain}/bin/aarch64-linux-android24-clang"
+          cc="${prebuilt}/bin/aarch64-linux-android24-clang"
+          if [ ! -x "$cc" ]; then
+            # Newer NDKs ship plain clang wrappers; fall back to the target-prefixed one.
+            cc="${prebuilt}/bin/clang"
+          fi
+          [ -x "$cc" ] || { echo "::error::no usable clang under ${prebuilt}/bin"; ls "${prebuilt}/bin" | head -20; exit 1; }
           echo "CAVEMAN_CC=${cc}" >> "$GITHUB_ENV"
-          echo "NDK_TOOLCHAIN=${toolchain}" >> "$GITHUB_ENV"
+          echo "NDK_TOOLCHAIN=${prebuilt}" >> "$GITHUB_ENV"
           "$cc" --version | head -1
 
       - name: Install pinned zig (cgo compiler for grammars)
