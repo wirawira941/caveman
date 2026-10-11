@@ -180,17 +180,24 @@ jobs:
       - name: Verify PIE + static
         run: |
           set -euo pipefail
+          # Compile the TLS alignment patcher here rather than trusting a
+          # committed binary (a Linux ELF would not run on a macOS runner, and a
+          # stale build is a silent failure mode).
+          cc -O2 -o scripts/tlsalign scripts/tlsalign.c
+
           # The linux/musl builds leave PT_TLS.p_align at 8, which Android
           # rejects with "TLS segment is underaligned". Fix it now, before the
           # checks below, so the rest of this step validates the final artifact.
           # This is the only way to get a runnable binary without a real Android
           # toolchain: zig has no Android libc headers, so GOOS=android cannot
           # build the cgo binaries at all.
-          for f in dist/binaries/*_linux_arm64; do
-            scripts/tlsalign "$f" || true
-          done
-
           fail=0
+          for f in dist/binaries/*_linux_arm64; do
+            if ! scripts/tlsalign "$f"; then
+              echo "::error::$f: scripts/tlsalign failed to patch PT_TLS p_align"
+              fail=1
+            fi
+          done
           for f in dist/binaries/*_linux_arm64; do
             # readelf prints "  Type:                              DYN (Shared object file)";
             # take the first token after the colon so the description text is ignored.
