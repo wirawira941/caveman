@@ -107,7 +107,7 @@ jobs:
             # "aarch64-linux-android<api>" (the API level is mandatory).
             # 24 = Android 5.0, old enough to run on essentially every device
             # while still providing the headers Go's runtime/cgo needs.
-            local cc_cmd="${ZIG} cc -target aarch64-linux-android24"
+            local cc_cmd="${ZIG} cc -target aarch64-linux-android24-ndk26"
             # GOOS=android is the key to the TLS alignment. Go's runtime knows
             # the android target and lays out TLS for Bionic (it parks its TCB in
             # the PT_TLS alignment padding); GOOS=linux builds for musl and emits
