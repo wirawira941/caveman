@@ -74,13 +74,12 @@ jobs:
           elf_type() { readelf -h "$1" 2>/dev/null | sed -n 's/^ *Type: *//p' | cut -d' ' -f1 | tr -d '[:space:]'; }
           is_pie() { [ "$(elf_type "$1")" = "DYN" ]; }
 
-          # Pure-Go binaries: -buildmode=pie works directly. Termux builds Go
-          # with GO_LDFLAGS="-extldflags=-pie"; either yields PIE, but
-          # -buildmode=pie is the documented path when there is no external link.
+          # Pure-Go binaries: -buildmode=pie works directly. GOOS=android for
+          # the same TLS-layout reason as the cgo binaries (see build_cgo).
           build_pure() {
             local name="$1" pkg="$2"
             echo "::group::build $name (pure Go, PIE)"
-            CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath \
+            CGO_ENABLED=0 GOOS=android GOARCH=arm64 go build -trimpath \
               -buildmode=pie \
               -ldflags "-s -w -X main.version=${VERSION}" \
               -o "dist/binaries/${name}_linux_arm64" \
@@ -103,7 +102,13 @@ jobs:
             # dynamic one (D).
             local out="dist/binaries/${name}_linux_arm64"
             local cc_cmd="${ZIG} cc -target aarch64-linux-musl"
-            local base=(CGO_ENABLED=1 GOOS=linux GOARCH=arm64)
+            # GOOS=android is the key to the TLS alignment. Go's runtime knows
+            # the android target and lays out TLS for Bionic (it parks its TCB in
+            # the PT_TLS alignment padding); GOOS=linux builds for musl and emits
+            # p_align 8, which Android rejects with "TLS segment is
+            # underaligned: alignment is 8, needs to be at least 64". Tailscale's
+            # Termux instructions use the same GOOS=android + buildmode=pie.
+            local base=(CGO_ENABLED=1 GOOS=android GOARCH=arm64)
             mkdir -p dist/recipes
             local recipe_file="dist/recipes/${name}"
 
@@ -117,15 +122,15 @@ jobs:
             local tls_align="-z common-page-size=64"
 
             # Each entry: "<label>|<ldflags>|<extra build flags>"
-            # -buildmode=pie is officially unsupported with -linkmode external and
-            # produces a non-PIE or broken binary; Termux builds Go with
-            # GO_LDFLAGS="-extldflags=-pie" instead, which makes the *external*
-            # linker emit PIE. That is what we try here.
+            # -extldflags=-pie alone fails: LLD then demands PIC objects, but
+            # only -buildmode=pie compiles Go code as PIC. So buildmode=pie must
+            # be present; what varies is how the *external* linker is told to
+            # produce PIE and whether it links statically.
             local recipes=(
-              "A|-linkmode external -extldflags '-static -s -pie' -s -w -X main.version=${VERSION}|"
-              "B|-linkmode external -extldflags '-static-pie -s' -s -w -X main.version=${VERSION}|"
-              "C|-extldflags '-static -s -pie' -s -w -X main.version=${VERSION}|"
-              "D|-extldflags '-pie' -s -w -X main.version=${VERSION}|"
+              "A|-linkmode external -extldflags '-static -s' -s -w -X main.version=${VERSION}|-buildmode=pie"
+              "B|-linkmode external -extldflags '-static-pie -s' -s -w -X main.version=${VERSION}|-buildmode=pie"
+              "C|-extldflags '-static -s' -s -w -X main.version=${VERSION}|-buildmode=pie"
+              "D|-s -w -X main.version=${VERSION}|-buildmode=pie"
             )
             local tags_arg="-tags netgo,osusergo"
 
