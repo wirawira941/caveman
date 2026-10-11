@@ -173,8 +173,10 @@ jobs:
             recipe="$(cat "dist/recipes/${name}" 2>/dev/null || echo unknown)"
             # Only the static recipes (A-C) are expected to be statically linked;
             # D is explicitly a dynamic build, so skip the check there.
+            # `file` prints "static-pie linked" for a static PIE and "statically
+            # linked" for a static non-PIE; accept either spelling.
             if [ "$recipe" != "D" ]; then
-              file "$f" | grep -q 'statically linked' || { file "$f"; echo "::error::$f is not static (recipe $recipe)" >&2; fail=1; }
+              file "$f" | grep -qE 'static(-pie)? linked' || { file "$f"; echo "::error::$f is not static (recipe $recipe)" >&2; fail=1; }
             fi
           done
           # Smoke-test the binaries actually run on this arm64 host. Every Go
